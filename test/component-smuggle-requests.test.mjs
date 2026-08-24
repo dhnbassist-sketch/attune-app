@@ -13,6 +13,7 @@ import {
   isLiveComponentSmuggleRequest,
   readPendingComponentSmuggleRequests,
   removeComponentSmuggleBrokerHeartbeat,
+  renewPendingComponentSmuggleRequest,
   restorePendingComponentSmuggleRequest,
   writeComponentSmuggleBrokerHeartbeat,
 } from '../dist-electron/component-smuggle-requests.js';
@@ -90,6 +91,11 @@ test('discovers only loopback Codex visualization webviews', () => {
     webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/target',
   }), true);
   assert.equal(isCodexLiveVisualizationTarget({
+    type: 'other',
+    url: 'codex-sandbox://codex-inline-visualization-abc.web-sandbox.oaiusercontent.com/',
+    webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/target',
+  }), true);
+  assert.equal(isCodexLiveVisualizationTarget({
     type: 'page',
     url: 'app://-/index.html',
     webSocketDebuggerUrl: 'ws://127.0.0.1:9222/devtools/page/target',
@@ -140,6 +146,30 @@ test('expired component requests are removed', () => {
   }
 });
 
+test('active component requests renew their lease past queue expiry', () => {
+  const homePath = mkdtempSync(join(tmpdir(), 'attune-smuggle-broker-'));
+  try {
+    const directory = componentSmuggleRequestDirectory(homePath);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const path = join(directory, `${requestId}.json`);
+    writeFileSync(path, JSON.stringify(request()), { mode: 0o600 });
+    assert.deepEqual(
+      readPendingComponentSmuggleRequests(
+        homePath,
+        Date.parse('2026-08-19T01:03:00.000Z'),
+        new Set([requestId]),
+      ),
+      [],
+    );
+    assert.equal(existsSync(path), true);
+    const renewed = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(renewed.createdAt, '2026-08-19T01:03:00.000Z');
+    assert.equal(renewed.expiresAt, '2026-08-19T01:33:00.000Z');
+  } finally {
+    rmSync(homePath, { recursive: true, force: true });
+  }
+});
+
 test('restores an unexpired request after a live bridge disconnects', () => {
   const homePath = mkdtempSync(join(tmpdir(), 'attune-smuggle-broker-'));
   try {
@@ -176,6 +206,21 @@ test('does not restore an expired request', () => {
       false,
     );
     assert.equal(existsSync(path), false);
+  } finally {
+    rmSync(homePath, { recursive: true, force: true });
+  }
+});
+
+test('renews an expired connected request for destination remount recovery', () => {
+  const homePath = mkdtempSync(join(tmpdir(), 'attune-smuggle-broker-'));
+  try {
+    const path = join(componentSmuggleRequestDirectory(homePath), `${requestId}.json`);
+    const now = Date.parse('2026-08-19T01:03:00.000Z');
+    const renewed = renewPendingComponentSmuggleRequest(path, request(), now);
+    assert.equal(renewed?.createdAt, '2026-08-19T01:03:00.000Z');
+    assert.equal(renewed?.expiresAt, '2026-08-19T01:33:00.000Z');
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(readPendingComponentSmuggleRequests(homePath, now).length, 1);
   } finally {
     rmSync(homePath, { recursive: true, force: true });
   }

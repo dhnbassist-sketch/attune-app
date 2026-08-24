@@ -33,6 +33,10 @@ export interface PendingLiveComponentSmuggleRequest {
   request: LiveComponentSmuggleRequest;
 }
 
+// A collapsed conversation visualization can remain unmounted for minutes.
+// Preserve its private reconnect lease across ordinary reading and app pauses.
+export const LIVE_COMPONENT_SMUGGLE_RECONNECT_TTL_MS = 30 * 60 * 1000;
+
 export function componentSmuggleRequestDirectory(homePath: string): string {
   return join(homePath, '.attune', 'component-smuggle-requests');
 }
@@ -70,6 +74,7 @@ export function removeComponentSmuggleBrokerHeartbeat(homePath: string, pid = pr
 export function readPendingComponentSmuggleRequests(
   homePath: string,
   now = Date.now(),
+  activeRequestIds: ReadonlySet<string> = new Set(),
 ): PendingLiveComponentSmuggleRequest[] {
   const directory = componentSmuggleRequestDirectory(homePath);
   let names: string[] = [];
@@ -86,6 +91,15 @@ export function readPendingComponentSmuggleRequests(
       if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) continue;
       const request = JSON.parse(readFileSync(path, 'utf8')) as unknown;
       if (!isLiveComponentSmuggleRequest(request)) continue;
+      // An active request is a lease, not a consumed queue item. Refresh it
+      // before expiry so a long-lived visualization can still reconnect after
+      // an Attune restart or a destination renderer remount.
+      if (activeRequestIds.has(request.requestId)) {
+        if (Date.parse(request.expiresAt) <= now + LIVE_COMPONENT_SMUGGLE_RECONNECT_TTL_MS / 2) {
+          renewPendingComponentSmuggleRequest(path, request, now);
+        }
+        continue;
+      }
       if (Date.parse(request.expiresAt) <= now) {
         rmSync(path, { force: true });
         continue;
@@ -112,6 +126,23 @@ export function restorePendingComponentSmuggleRequest(
     rmSync(temporaryPath, { force: true });
   }
   return true;
+}
+
+export function renewPendingComponentSmuggleRequest(
+  path: string,
+  request: LiveComponentSmuggleRequest,
+  now = Date.now(),
+  ttlMs = LIVE_COMPONENT_SMUGGLE_RECONNECT_TTL_MS,
+): LiveComponentSmuggleRequest | null {
+  if (!isLiveComponentSmuggleRequest(request)
+    || !Number.isFinite(ttlMs)
+    || ttlMs <= 0) return null;
+  const renewed: LiveComponentSmuggleRequest = {
+    ...request,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ttlMs).toISOString(),
+  };
+  return restorePendingComponentSmuggleRequest(path, renewed, now) ? renewed : null;
 }
 
 export function isLiveComponentSmuggleRequest(value: unknown): value is LiveComponentSmuggleRequest {
@@ -163,8 +194,11 @@ export function isCodexLiveVisualizationTarget(candidate: {
   type?: string;
   url?: string;
   webSocketDebuggerUrl?: string;
-}): candidate is { type: 'webview'; url: string; webSocketDebuggerUrl: string } {
-  return candidate.type === 'webview'
+}): candidate is { type: 'webview' | 'other'; url: string; webSocketDebuggerUrl: string } {
+  // Codex has reported inline visualization renderer targets as both
+  // `webview` and `other` across Electron releases. The private sandbox URL
+  // and loopback-only debugger endpoint remain the authoritative boundaries.
+  return (candidate.type === 'webview' || candidate.type === 'other')
     && typeof candidate.url === 'string'
     && candidate.url.startsWith('codex-sandbox://codex-inline-visualization-')
     && typeof candidate.webSocketDebuggerUrl === 'string'

@@ -73,7 +73,7 @@ async function run() {
         [data-fixture-editor-cover] { position: absolute; inset: 0; z-index: 2; background: transparent; }
       </style></head><body><aside id="outside-source-component">Unrelated activity</aside>
         <section data-attune-host-roles="fixture.source" data-attune-smuggle-anchor="source-token">
-          <strong>Live card <span role="textbox" contenteditable="true" aria-label="Editor">Draft</span></strong><button aria-label="Increment"><svg viewBox="0 0 16 16"><path fill-rule="evenodd" d="M2 7h12v2H2z"/></svg>Count 0</button>
+          <strong>Live card <span role="textbox" contenteditable="true" aria-label="Editor">Draft</span></strong><button id="fixture-increment" aria-label="Increment"><svg viewBox="0 0 16 16"><path fill-rule="evenodd" d="M2 7h12v2H2z"/></svg>Count 0</button><tool-tip for="fixture-increment" role="tooltip" style="display:none">Increment the live count</tool-tip>
           <div data-fixture-covered-editor><textarea aria-label="Covered editor">Seed</textarea><div data-fixture-editor-cover></div></div>
           <table data-fixture-table><thead><tr><th colspan="3" scope="colgroup">August</th><th colspan="2" scope="colgroup">September</th></tr></thead><tbody><tr><td>A</td><td>B</td><td>C</td><td>D</td><td>E</td></tr></tbody></table>
           <canvas data-fixture-canvas width="80" height="24" style="width:80px;height:24px"></canvas>
@@ -147,6 +147,7 @@ async function run() {
           </main>
           <aside style="width:180px;height:80px" data-attune-host-roles="fixture.target.two">Second target</aside>
         </div>
+        <div data-attune-smuggle-slot="attune-live-fixture" aria-label="Live slot" style="width:300px;height:80px"></div>
         <script>
           document.addEventListener('pointerdown', (event) => {
             if (event.composedPath().some((item) => item?.tagName === 'ATTUNE-COMPONENT-SMUGGLE')) {
@@ -224,6 +225,30 @@ async function run() {
   if (firstTargetSurvived.runtimeCount !== 1 || firstTargetSurvived.hostCount !== 1 || !firstTargetSurvived.connected) {
     throw new Error(`Cleaning one target removed its sibling: ${JSON.stringify(firstTargetSurvived)}`);
   }
+
+  const liveSlotSelection = selection({
+    intent: 'smuggle-target', roles: [], selector: '[data-attune-smuggle-slot="attune-live-fixture"]',
+    tag: 'div', label: 'Live slot', text: '', attributes: { 'data-attune-smuggle-slot': 'attune-live-fixture' },
+    ancestor: { tag: 'body', domRole: '', label: '' },
+  });
+  const firstLiveSlotAnchor = componentSmuggleAnchor(liveSlotSelection, 'target-live-slot-old');
+  const secondLiveSlotAnchor = componentSmuggleAnchor(liveSlotSelection, 'target-live-slot-new');
+  await targetWindow.webContents.executeJavaScript(buildComponentSmuggleTargetExpression(firstLiveSlotAnchor));
+  await targetWindow.webContents.executeJavaScript(buildComponentSmuggleTargetExpression(secondLiveSlotAnchor));
+  const exclusiveLiveSlot = await targetWindow.webContents.executeJavaScript(`({
+    hostTokens: [...document.querySelector('[data-attune-smuggle-slot="attune-live-fixture"]').children]
+      .filter((element) => element.tagName === 'ATTUNE-COMPONENT-SMUGGLE')
+      .map((element) => element.getAttribute('data-attune-component-smuggle-token')),
+    oldRuntime: Boolean(window.__attuneComponentSmuggleTargets?.['target-live-slot-old']),
+    newConnected: window.__attuneComponentSmuggleTargets?.['target-live-slot-new']?.status?.().connected,
+  })`);
+  if (exclusiveLiveSlot.hostTokens.join(',') !== 'target-live-slot-new'
+    || exclusiveLiveSlot.oldRuntime || !exclusiveLiveSlot.newConnected) {
+    throw new Error(`A live slot retained an orphan input owner: ${JSON.stringify(exclusiveLiveSlot)}`);
+  }
+  await targetWindow.webContents.executeJavaScript(
+    `window.__attuneComponentSmuggleTargets['target-live-slot-new'].cleanup()`,
+  );
 
   const ancestorReplacementAnchor = componentSmuggleAnchor(selection({
     intent: 'smuggle-target', placement: 'replace', roles: [], selector: '#target-row',
@@ -329,6 +354,8 @@ async function run() {
       connected: host?.isConnected,
       text: host?.shadowRoot?.querySelector('[data-attune-component-smuggle="surface"]')?.textContent,
       buttonPath: host?.shadowRoot?.querySelector('[aria-label="Increment"]')?.getAttribute('data-attune-smuggle-path'),
+      buttonTitle: host?.shadowRoot?.querySelector('[aria-label="Increment"]')?.getAttribute('title'),
+      surfaceOverflow: host?.shadowRoot?.querySelector('[data-attune-component-smuggle="surface"]')?.style.overflow,
       layout: (() => {
         const root = host?.shadowRoot?.querySelector('[data-attune-component-smuggle="surface"]')?.firstElementChild?.firstElementChild;
         const button = root?.querySelector('[aria-label="Increment"]');
@@ -355,6 +382,7 @@ async function run() {
     };
   })()`);
   if (!initial.connected || !initial.text.includes('Live card') || !initial.text.includes('Ready') || !initial.buttonPath
+    || initial.buttonTitle !== 'Increment the live count' || initial.surfaceOverflow !== 'visible'
     || !initial.layout.fullSize || !initial.layout.namedGridPlacement || initial.layout.viewBox !== '0 0 16 16'
     || JSON.stringify(initial.layout.tableStructure) !== JSON.stringify([
       { colSpan: 3, colspan: '3', scope: 'colgroup' },
@@ -509,7 +537,7 @@ async function run() {
     throw new Error(`Native pointer input did not round-trip through Chromium: ${JSON.stringify(nativeHoverState)}`);
   }
 
-  const streamedInteractionReady = await targetWindow.webContents.executeJavaScript(`(() => {
+  const screenCaptureOnlyReady = await targetWindow.webContents.executeJavaScript(`(() => {
     const api = window.__attuneComponentSmuggleTarget;
     api.applyVisual({
       sequence: 1,
@@ -519,10 +547,28 @@ async function run() {
     const shadow = document.querySelector('attune-component-smuggle').shadowRoot;
     const frame = shadow.querySelector('[data-attune-component-smuggle="frame"]');
     const viewport = shadow.querySelector('[data-attune-component-smuggle="visual-viewport"]');
-    return Boolean(frame && frame.style.opacity === '0' && frame.style.pointerEvents === 'none'
-      && viewport.style.pointerEvents === 'auto');
+    const buttonBounds = shadow.querySelector('[aria-label="Increment"]').getBoundingClientRect();
+    viewport.dispatchEvent(new PointerEvent('pointermove', {
+      clientX: buttonBounds.x + buttonBounds.width / 2,
+      clientY: buttonBounds.y + buttonBounds.height / 2,
+      bubbles: true,
+      composed: true,
+    }));
+    const tooltip = shadow.querySelector('[data-attune-component-smuggle="visual-hover-tooltip"]');
+    return {
+      ready: Boolean(frame && frame.style.opacity === '0' && frame.style.pointerEvents === 'none'
+        && viewport.style.pointerEvents === 'auto'),
+      tooltipText: tooltip?.textContent,
+      tooltipDisplay: tooltip?.style.display,
+      surfaceOverflow: shadow.querySelector('[data-attune-component-smuggle="surface"]')?.style.overflow,
+    };
   })()`);
-  if (!streamedInteractionReady) throw new Error('The streamed pixels did not take ownership from the passive DOM twin.');
+  if (!screenCaptureOnlyReady.ready
+    || screenCaptureOnlyReady.tooltipText !== ''
+    || screenCaptureOnlyReady.tooltipDisplay !== 'none'
+    || screenCaptureOnlyReady.surfaceOverflow !== 'hidden') {
+    throw new Error(`Native visual mode painted a DOM overlay above captured pixels: ${JSON.stringify(screenCaptureOnlyReady)}`);
+  }
 
   await targetWindow.webContents.executeJavaScript(`(() => {
     const shadow = document.querySelector('attune-component-smuggle').shadowRoot;

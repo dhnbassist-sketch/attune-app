@@ -149,6 +149,7 @@ export interface ComponentSmugglePageClient {
   ): Promise<void>;
   subscribeActionSignal?(listener: () => void): Promise<() => void | Promise<void>>;
   subscribeVisualDirtySignal?(listener: () => void): Promise<() => void | Promise<void>>;
+  subscribeInvalidation?(listener: (error: Error) => void): Promise<() => void | Promise<void>>;
   captureComponentFrame?(region: ComponentSmuggleCaptureRegion): Promise<string | null>;
   close(): void;
 }
@@ -284,7 +285,7 @@ function runComponentSmuggleSource(anchor: ComponentSmuggleAnchor, preferBounded
     /^(aria-|data-)/.test(name)
     || [
       'id', 'role', 'title', 'alt', 'href', 'src', 'type', 'name', 'placeholder', 'tabindex', 'contenteditable',
-      'colspan', 'rowspan', 'span', 'scope', 'headers', 'abbr',
+      'colspan', 'rowspan', 'span', 'scope', 'headers', 'abbr', 'for',
       'xmlns', 'xmlns:xlink', 'viewbox', 'preserveaspectratio', 'd', 'fill', 'fill-rule', 'fill-opacity',
       'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin', 'stroke-dasharray', 'stroke-opacity',
       'clip-path', 'clip-rule', 'mask', 'filter', 'opacity', 'transform', 'vector-effect',
@@ -1442,6 +1443,24 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
 
   let mount = resolveAnchor();
   if (!mount) return { ok: false, reason: 'target-anchor-unresolved' };
+  if (mount.hasAttribute?.('data-attune-smuggle-slot')) {
+    // Conversation visualizations survive independently of the Attune process.
+    // A restart can therefore leave an orphan host in the same private slot;
+    // it would sit above the replacement and consume input with no live bridge.
+    // Live slots are exclusive, while ordinary app targets still support
+    // multiple concurrent smuggles.
+    for (const existingHost of [...mount.querySelectorAll?.(':scope > attune-component-smuggle[data-attune-component-smuggle-token]') || []]) {
+      const existingToken = existingHost.getAttribute?.('data-attune-component-smuggle-token');
+      const existingRuntime = existingToken ? targetRuntimes[existingToken] : null;
+      try { existingRuntime?.cleanup?.(); } catch {}
+      existingHost.remove?.();
+      if (existingToken && targetRuntimes[existingToken] === existingRuntime) delete targetRuntimes[existingToken];
+      if (runtime.__attuneComponentSmuggleTarget === existingRuntime) delete runtime.__attuneComponentSmuggleTarget;
+    }
+    runtime.__attuneSmuggleAnchors ||= {};
+    runtime.__attuneSmuggleAnchors[anchor.token] = mount;
+    mount.setAttribute?.('data-attune-smuggle-anchor', anchor.token);
+  }
   const placement = anchor.placement === 'replace' || anchor.placement === 'top' || anchor.placement === 'bottom'
     || anchor.placement === 'left' || anchor.placement === 'right'
     ? anchor.placement
@@ -1466,6 +1485,16 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     display: 'block', position: 'absolute', inset: '0', zIndex: '2', overflow: 'hidden', outline: 'none',
     pointerEvents: 'auto',
     userSelect: 'none', WebkitUserSelect: 'none', transformOrigin: 'top left',
+  });
+  const visualHoverTooltip = doc.createElement('div');
+  visualHoverTooltip.setAttribute('data-attune-component-smuggle', 'visual-hover-tooltip');
+  visualHoverTooltip.setAttribute('role', 'tooltip');
+  Object.assign(visualHoverTooltip.style, {
+    display: 'none', position: 'absolute', zIndex: '3', maxWidth: '320px', padding: '6px 8px',
+    border: '1px solid rgba(255,255,255,.18)', borderRadius: '6px',
+    background: 'rgb(31,35,40)', color: 'rgb(240,246,252)', boxShadow: '0 6px 18px rgba(0,0,0,.28)',
+    font: '12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif', whiteSpace: 'normal',
+    pointerEvents: 'none', userSelect: 'none', WebkitUserSelect: 'none',
   });
   const visualImage = doc.createElement('img');
   visualImage.alt = '';
@@ -1872,6 +1901,47 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     }
     enqueueAction({ type: 'wheel', ...action });
   };
+  const hideVisualHoverTooltip = () => {
+    visualHoverTooltip.style.display = 'none';
+    visualHoverTooltip.textContent = '';
+  };
+  const updateVisualHoverTooltip = (event: any) => {
+    if (!currentVisualFrame || !currentFrame?.isConnected) {
+      hideVisualHoverTooltip();
+      return;
+    }
+    const viewportPointerEvents = visualViewport.style.pointerEvents;
+    const framePointerEvents = currentFrame.style.pointerEvents;
+    visualViewport.style.pointerEvents = 'none';
+    currentFrame.style.pointerEvents = 'auto';
+    let title = '';
+    try {
+      const candidates = shadow.elementsFromPoint?.(Number(event.clientX) || 0, Number(event.clientY) || 0) || [];
+      for (const candidate of candidates) {
+        if (!currentFrame.contains(candidate)) continue;
+        const titled = candidate.closest?.('[title]');
+        if (!titled || !currentFrame.contains(titled)) continue;
+        title = String(titled.getAttribute('title') || '').trim();
+        if (title) break;
+      }
+    } finally {
+      currentFrame.style.pointerEvents = framePointerEvents;
+      visualViewport.style.pointerEvents = viewportPointerEvents;
+    }
+    if (!title) {
+      hideVisualHoverTooltip();
+      return;
+    }
+    if (visualHoverTooltip.textContent !== title) visualHoverTooltip.textContent = title;
+    visualHoverTooltip.style.display = 'block';
+    const surfaceBounds = surface.getBoundingClientRect();
+    const preferredLeft = (Number(event.clientX) || 0) - surfaceBounds.left + 12;
+    const preferredTop = (Number(event.clientY) || 0) - surfaceBounds.top + 14;
+    const maximumLeft = Math.max(4, surfaceBounds.width - visualHoverTooltip.offsetWidth - 4);
+    const maximumTop = Math.max(4, surfaceBounds.height - visualHoverTooltip.offsetHeight - 4);
+    visualHoverTooltip.style.left = `${Math.max(4, Math.min(maximumLeft, preferredLeft))}px`;
+    visualHoverTooltip.style.top = `${Math.max(4, Math.min(maximumTop, preferredTop))}px`;
+  };
   let visualRelayFocusGeneration = 0;
   let visualRelayArmed = false;
   let visualRelayFocusTimer: any = null;
@@ -1968,6 +2038,10 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     dragging: boolean;
   } | null = null;
   visualViewport.addEventListener('pointermove', (event: any) => {
+    // Native visual mode is screen-capture-only. Safari's own hover UI arrives
+    // in the next captured frame; do not paint a destination-side DOM tooltip
+    // over those pixels.
+    hideVisualHoverTooltip();
     if (visualPointerState
       && (visualPointerState.pointerId === undefined || visualPointerState.pointerId === event.pointerId)) {
       event.preventDefault();
@@ -1988,6 +2062,7 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     if (position) enqueueVisualHover(position, event.isTrusted);
   }, true);
   visualViewport.addEventListener('pointerleave', (event: any) => {
+    hideVisualHoverTooltip();
     event.stopPropagation();
     if (visualPointerState) return;
     enqueueVisualHover(null, event.isTrusted);
@@ -2392,6 +2467,36 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     }
     return element;
   };
+  const syncTooltipTitles = (rootNode: any) => {
+    if (!rootNode?.querySelectorAll) return;
+    for (const element of rootNode.querySelectorAll('[data-attune-smuggle-derived-title]')) {
+      element.removeAttribute('title');
+      element.removeAttribute('data-attune-smuggle-derived-title');
+    }
+    const applyDerivedTitle = (target: any, tooltip: any) => {
+      const text = String(tooltip?.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!target || !text || target.hasAttribute('title')) return;
+      target.setAttribute('title', text.slice(0, 1000));
+      target.setAttribute('data-attune-smuggle-derived-title', 'true');
+    };
+    for (const tooltip of rootNode.querySelectorAll('tool-tip[for],[role="tooltip"][for]')) {
+      const targetId = String(tooltip.getAttribute('for') || '');
+      if (!targetId) continue;
+      const target = [...rootNode.querySelectorAll('[id]')].find((element: any) => element.id === targetId);
+      applyDerivedTitle(target, tooltip);
+    }
+    for (const target of rootNode.querySelectorAll('[aria-describedby]')) {
+      for (const id of String(target.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean)) {
+        const tooltip = [...rootNode.querySelectorAll('[id]')].find((element: any) => (
+          element.id === id && element.getAttribute('role') === 'tooltip'
+        ));
+        if (tooltip) {
+          applyDerivedTitle(target, tooltip);
+          break;
+        }
+      }
+    }
+  };
   let currentFrame: any = null;
   let currentSourceSize = { width: 0, height: 0 };
   let currentVisualFrame: any = null;
@@ -2498,6 +2603,10 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
   const renderSatellites = (satellites: any[]) => {
     for (const satellite of currentSatellites) satellite.wrapper.remove();
     currentSatellites = [];
+    // A native frame already contains every source-composited popup inside the
+    // selected region. Reconstructing portal/satellite DOM above it changes
+    // opacity, fonts, and antialiasing, so reserve satellites for DOM modes.
+    if (currentVisualFrame) return;
     for (const satellite of satellites || []) {
       const next = createNode(satellite.tree);
       if (!next) continue;
@@ -2534,6 +2643,10 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     // metadata. DOM and hybrid modes continue using the synchronized tree.
     currentFrame.style.pointerEvents = currentVisualFrame ? 'none' : 'auto';
     visualViewport.style.pointerEvents = currentVisualFrame ? 'auto' : 'none';
+    // The DOM twin can reflow by a fractional pixel in the destination engine.
+    // Do not cut off its far border against the source's rounded border box.
+    // Native pixel frames still require a hard viewport clip when panned/resized.
+    surface.style.overflow = currentVisualFrame ? 'hidden' : 'visible';
     positionSatellites();
     layoutContainedHost();
     positionResizeLayer();
@@ -2545,6 +2658,7 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     const scale = displayScale();
     clampLocalViewOffset();
     applyHostGeometry(view);
+    surface.style.overflow = 'hidden';
     visualViewport.style.width = `${view.width}px`;
     visualViewport.style.height = `${view.height}px`;
     visualImage.style.left = `${Number(currentVisualFrame.offsetX || 0) * scale.x - localViewOffset.x}px`;
@@ -2708,11 +2822,15 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
     appendHost();
     currentVisualSequence = Number(frame.sequence);
     currentVisualFrame = frame;
+    hideVisualHoverTooltip();
+    for (const satellite of currentSatellites) satellite.wrapper.remove();
+    currentSatellites = [];
     currentSourceSize = {
       width: Number(frame.rootWidth || frame.width) || 0,
       height: Number(frame.rootHeight || frame.height) || 0,
     };
     if (visualViewport.parentElement !== surface) surface.appendChild(visualViewport);
+    if (visualHoverTooltip.parentElement !== surface) surface.appendChild(visualHoverTooltip);
     if (currentFrame?.isConnected) {
       currentFrame.style.opacity = '0';
       currentFrame.style.pointerEvents = 'none';
@@ -2951,6 +3069,7 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
           }
         }
       }
+      syncTooltipTitles(currentFrame);
       fitSurface();
       restoreVisualIslands();
       restoreFocus(focusState);
@@ -3054,7 +3173,12 @@ function runComponentSmuggleTarget(anchor: ComponentSmuggleAnchor) {
 type CdpResponse = {
   id?: number;
   method?: string;
-  params?: { name?: string; payload?: string };
+  params?: {
+    name?: string;
+    payload?: string;
+    executionContextId?: number;
+    reason?: string;
+  };
   result?: { result?: { value?: unknown; description?: string }; data?: string; [key: string]: unknown };
   error?: { message?: string };
 };
@@ -3072,6 +3196,8 @@ export class CdpPageClient implements ComponentSmugglePageClient {
   private nextId = 1;
   private actionSignalListener: (() => void) | null = null;
   private visualDirtySignalListener: (() => void) | null = null;
+  private readonly invalidationListeners = new Set<(error: Error) => void>();
+  private invalidationError: Error | null = null;
   private pageCaptureEnabled = false;
   private readonly pending = new Map<number, {
     resolve(value: CdpResponse['result']): void;
@@ -3097,6 +3223,20 @@ export class CdpPageClient implements ComponentSmugglePageClient {
     this.socket.addEventListener('message', (event) => {
       let message: CdpResponse;
       try { message = JSON.parse(String(event.data)); } catch { return; }
+      if (message.method === 'Runtime.executionContextDestroyed'
+        && this.executionContextId
+        && message.params?.executionContextId === this.executionContextId) {
+        this.invalidate(new Error(`${this.label} execution context was destroyed`));
+        return;
+      }
+      if (message.method === 'Runtime.executionContextsCleared' && this.executionContextId) {
+        this.invalidate(new Error(`${this.label} execution contexts were cleared`));
+        return;
+      }
+      if (message.method === 'Inspector.detached') {
+        this.invalidate(new Error(`${this.label} detached${message.params?.reason ? `: ${message.params.reason}` : ''}`));
+        return;
+      }
       if (message.method === 'Runtime.bindingCalled'
         && message.params?.name === CdpPageClient.actionBindingName) {
         this.actionSignalListener?.();
@@ -3114,19 +3254,24 @@ export class CdpPageClient implements ComponentSmugglePageClient {
       if (message.error) pending.reject(new Error(`${this.label}: ${message.error.message || 'CDP command failed'}`));
       else pending.resolve(message.result);
     });
-    const rejectPending = () => {
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error(`${this.label} disconnected`));
-      }
-      this.pending.clear();
-    };
-    this.socket.addEventListener('close', rejectPending);
-    this.socket.addEventListener('error', rejectPending);
+    this.socket.addEventListener('close', () => this.invalidate(new Error(`${this.label} disconnected`)));
+    this.socket.addEventListener('error', () => this.invalidate(new Error(`${this.label} disconnected`)));
+  }
+
+  private invalidate(error: Error): void {
+    if (this.invalidationError) return;
+    this.invalidationError = error;
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+    for (const listener of this.invalidationListeners) listener(error);
   }
 
   private send(method: string, params: Record<string, unknown> = {}, timeoutMs = 15000): Promise<CdpResponse['result']> {
     if (!this.socket) throw new Error(`${this.label} is not connected`);
+    if (this.invalidationError) throw this.invalidationError;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -3256,6 +3401,14 @@ export class CdpPageClient implements ComponentSmugglePageClient {
     };
   }
 
+  async subscribeInvalidation(listener: (error: Error) => void): Promise<() => void> {
+    this.invalidationListeners.add(listener);
+    await this.send('Runtime.enable');
+    return () => {
+      this.invalidationListeners.delete(listener);
+    };
+  }
+
   async captureComponentFrame(region: ComponentSmuggleCaptureRegion): Promise<string | null> {
     if (!this.pageCaptureEnabled) {
       await this.send('Page.enable');
@@ -3308,6 +3461,8 @@ export class ComponentSmuggleBridge {
   private stopVisualFrameStream: (() => void | Promise<void>) | null = null;
   private stopActionSignal: (() => void | Promise<void>) | null = null;
   private stopVisualDirtySignal: (() => void | Promise<void>) | null = null;
+  private stopTargetInvalidation: (() => void | Promise<void>) | null = null;
+  private targetInvalidationHandling = false;
   private adaptiveCaptureRunning = false;
   private adaptiveCaptureRequested = false;
   private adaptiveCaptureDisabled = false;
@@ -3328,6 +3483,8 @@ export class ComponentSmuggleBridge {
   private readonly wakeSourcePage?: () => Promise<unknown>;
   private readonly adaptiveCaptureEnabled: boolean;
   private readonly runtimeMaintenanceEnabled: boolean;
+  private readonly targetTimeoutIsFatal: boolean;
+  private readonly visualStreamRequired: boolean;
   private renderMode: 'dom-twin' | 'hybrid' | 'visual' = 'dom-twin';
   private hybridCaptureRunning = false;
   private hybridCaptureRequested = false;
@@ -3346,11 +3503,15 @@ export class ComponentSmuggleBridge {
       targetVisual?: ComponentSmugglePageClient;
       adaptiveCapture?: boolean;
       runtimeMaintenance?: boolean;
+      targetTimeoutIsFatal?: boolean;
+      visualStreamRequired?: boolean;
       wakeSourcePage?: () => Promise<unknown>;
     } = {},
   ) {
     this.adaptiveCaptureEnabled = pageClients.adaptiveCapture !== false;
     this.runtimeMaintenanceEnabled = pageClients.runtimeMaintenance !== false;
+    this.targetTimeoutIsFatal = pageClients.targetTimeoutIsFatal === true;
+    this.visualStreamRequired = pageClients.visualStreamRequired === true;
     this.wakeSourcePage = pageClients.wakeSourcePage;
     const hasVisualStream = Boolean(startFrameStream);
     this.sourceClient = pageClients.source
@@ -3469,6 +3630,11 @@ export class ComponentSmuggleBridge {
     ]);
     if (!sourceResult?.ok) throw new Error(`Could not resolve the source component: ${sourceResult?.reason || 'unknown error'}`);
     if (!targetResult?.ok) throw new Error(`Could not resolve the destination: ${targetResult?.reason || 'unknown error'}`);
+    if (this.targetClient.subscribeInvalidation) {
+      this.stopTargetInvalidation = await this.targetClient.subscribeInvalidation(
+        error => this.handleTargetInvalidation(error),
+      );
+    }
     const visualIslandCount = Math.max(0, Number(sourceResult.visualIslandCount) || 0);
     this.renderMode = this.renderModeFor(visualIslandCount);
     await this.installSourceFonts(sourceResult);
@@ -3493,7 +3659,7 @@ export class ComponentSmuggleBridge {
     try {
       await this.ensureVisualFrameStream(true);
     } catch (error) {
-      if (!this.startFrameStream || this.renderMode !== 'visual') throw error;
+      if (!this.startFrameStream || this.renderMode !== 'visual' || this.visualStreamRequired) throw error;
       this.nativeStreamDisabled = true;
       this.log('visual-stream-fallback', {
         message: error instanceof Error ? error.message : String(error),
@@ -3535,7 +3701,21 @@ export class ComponentSmuggleBridge {
     // occluded/fullscreen renderer is suspended. The CDP socket and both page
     // runtimes are still valid in that case, so tearing down the smuggle turns
     // an ordinary app switch into permanent component removal.
-    return /\btimed out\b/i.test(error.message);
+    if (!/\btimed out\b/i.test(error.message)) return false;
+    if (this.targetTimeoutIsFatal && /\btarget(?: visual)?\s+Runtime\.evaluate timed out\b/i.test(error.message)) {
+      return false;
+    }
+    return true;
+  }
+
+  private handleTargetInvalidation(error: Error): void {
+    if (this.stopped || this.targetInvalidationHandling) return;
+    this.targetInvalidationHandling = true;
+    this.log('target-invalidated', { message: error.message });
+    void (async () => {
+      await this.stop(true);
+      this.onStop?.('error', error);
+    })();
   }
 
   private requestRuntimeMaintenance(): void {
@@ -4266,6 +4446,9 @@ export class ComponentSmuggleBridge {
     const stopVisualDirtySignal = this.stopVisualDirtySignal;
     this.stopVisualDirtySignal = null;
     if (stopVisualDirtySignal) await stopVisualDirtySignal();
+    const stopTargetInvalidation = this.stopTargetInvalidation;
+    this.stopTargetInvalidation = null;
+    if (stopTargetInvalidation) await stopTargetInvalidation();
     const stopFrameStream = this.stopVisualFrameStream;
     this.stopVisualFrameStream = null;
     if (stopFrameStream) await stopFrameStream();

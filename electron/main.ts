@@ -62,7 +62,7 @@ import {
   isCodexLiveVisualizationTarget,
   readPendingComponentSmuggleRequests,
   removeComponentSmuggleBrokerHeartbeat,
-  restorePendingComponentSmuggleRequest,
+  renewPendingComponentSmuggleRequest,
   writeComponentSmuggleBrokerHeartbeat,
   type LiveComponentSmuggleRequest,
 } from './component-smuggle-requests.js';
@@ -329,6 +329,7 @@ const lastWrapAtByAppId = new Map<string, number>();
 const iconDataUrlByAppPath = new Map<string, Promise<string | null>>();
 const componentSmuggleBrokerErrorAtByRequest = new Map<string, number>();
 const activeComponentSmuggles = new Set<ComponentSmuggleBridge>();
+const activeLiveComponentRequestIds = new Set<string>();
 const appDiscoveryService = new AppDiscoveryService();
 
 configureUserDataPath();
@@ -384,6 +385,7 @@ app.on('before-quit', () => {
   if (pendingComponentSmuggle) clearTimeout(pendingComponentSmuggle.timeout);
   for (const bridge of activeComponentSmuggles) void bridge.stop();
   activeComponentSmuggles.clear();
+  activeLiveComponentRequestIds.clear();
   appDiscoveryService.close();
   for (const watcher of scaffoldWatchers.splice(0)) watcher.close();
 });
@@ -414,8 +416,10 @@ async function processComponentSmuggleRequests(homePath: string): Promise<void> 
   if (componentSmuggleBrokerRunning) return;
   componentSmuggleBrokerRunning = true;
   try {
-    const pending = readPendingComponentSmuggleRequests(homePath);
+    const pending = readPendingComponentSmuggleRequests(homePath, Date.now(), activeLiveComponentRequestIds);
     for (const item of pending) {
+      const requestId = item.request.requestId;
+      if (activeLiveComponentRequestIds.has(requestId)) continue;
       const resolvedTarget = await resolveCodexLiveComponentTarget(item.request);
       if (!resolvedTarget) continue;
       const { endpoint: target, executionContextId } = resolvedTarget;
@@ -434,19 +438,20 @@ async function processComponentSmuggleRequests(homePath: string): Promise<void> 
         target,
         (reason, error) => {
           activeComponentSmuggles.delete(bridge);
+          activeLiveComponentRequestIds.delete(requestId);
           if (reason === 'error') {
-            restorePendingComponentSmuggleRequest(item.path, item.request);
+            renewPendingComponentSmuggleRequest(item.path, item.request);
             console.warn('[attune] live conversation component stopped:', error?.message || 'renderer disconnected');
+          } else {
+            rmSync(item.path, { force: true });
           }
         },
         chord => forwardComponentSmuggleKeyChord(item.request.source.appPid, chord),
-        item.request.source.safariPage
-          ? undefined
-          : (region, onFrame) => startComponentSmuggleWindowStream(
-            item.request.source.appPid,
-            region,
-            onFrame,
-          ),
+        (region, onFrame) => startComponentSmuggleWindowStream(
+          item.request.source.appPid,
+          region,
+          onFrame,
+        ),
         {
           source: item.request.source.safariPage
             ? new SafariAppleEventsPageClient(
@@ -456,6 +461,8 @@ async function processComponentSmuggleRequests(homePath: string): Promise<void> 
             : undefined,
           target: targetClient,
           targetVisual: targetVisualClient,
+          targetTimeoutIsFatal: true,
+          visualStreamRequired: Boolean(item.request.source.safariPage),
           runtimeMaintenance: !item.request.source.safariPage
             || process.env.ATTUNE_COMPONENT_SMUGGLE_SAFARI_MAINTENANCE_ENABLED !== '0',
           wakeSourcePage: item.request.source.safariPage
@@ -464,10 +471,12 @@ async function processComponentSmuggleRequests(homePath: string): Promise<void> 
         },
       );
       activeComponentSmuggles.add(bridge);
+      activeLiveComponentRequestIds.add(requestId);
       try {
         await bridge.start();
       } catch (error) {
         activeComponentSmuggles.delete(bridge);
+        activeLiveComponentRequestIds.delete(requestId);
         await bridge.stop(true);
         const message = error instanceof Error ? error.message : String(error);
         const now = Date.now();
@@ -478,8 +487,11 @@ async function processComponentSmuggleRequests(homePath: string): Promise<void> 
         }
         continue;
       }
-      componentSmuggleBrokerErrorAtByRequest.delete(item.request.requestId);
-      rmSync(item.path, { force: true });
+      // start() can finish just after its target disconnected. The stop callback
+      // removes the bridge and releases the request, so do not report that race
+      // as connected or consume its renewed lease.
+      if (!activeComponentSmuggles.has(bridge)) continue;
+      componentSmuggleBrokerErrorAtByRequest.delete(requestId);
       console.info(`[attune] live component connected: ${item.request.source.appName} → Codex`);
       break;
     }

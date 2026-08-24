@@ -9,6 +9,7 @@ import test from 'node:test';
 import {
   buildComponentSmuggleSourceExpression,
   buildComponentSmuggleTargetExpression,
+  CdpPageClient,
   ComponentSmuggleBridge,
   componentSmuggleAnchor,
   componentSmuggleEmbeddedFontCss,
@@ -45,6 +46,60 @@ test('builds self-contained source and target smuggling runtimes', () => {
   assert.match(targetExpression, /__attuneComponentSmuggleTargets/);
   assert.match(targetExpression, /parkForAncestorReplacement/);
   assert.equal(componentSmuggleAnchor({ ...selection, placement: 'replace' }, 'replace-token').placement, 'replace');
+});
+
+test('invalidates a pinned CDP client when its execution context is destroyed', async () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const sockets = [];
+  class FixtureWebSocket {
+    listeners = new Map();
+
+    constructor() {
+      sockets.push(this);
+      queueMicrotask(() => this.emit('open', {}));
+    }
+
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || [];
+      listeners.push(listener);
+      this.listeners.set(type, listeners);
+    }
+
+    send(serialized) {
+      const message = JSON.parse(serialized);
+      queueMicrotask(() => this.emit('message', {
+        data: JSON.stringify({ id: message.id, result: {} }),
+      }));
+    }
+
+    close() {
+      this.emit('close', {});
+    }
+
+    emit(type, event) {
+      for (const listener of this.listeners.get(type) || []) listener(event);
+    }
+  }
+
+  globalThis.WebSocket = FixtureWebSocket;
+  try {
+    const client = new CdpPageClient('ws://127.0.0.1/devtools/page/fixture', 'Fixture target', 42);
+    await client.connect();
+    let invalidation = null;
+    const unsubscribe = await client.subscribeInvalidation((error) => { invalidation = error; });
+    sockets[0].emit('message', {
+      data: JSON.stringify({
+        method: 'Runtime.executionContextDestroyed',
+        params: { executionContextId: 42 },
+      }),
+    });
+    assert.match(invalidation?.message || '', /execution context was destroyed/);
+    await assert.rejects(client.evaluate('1'), /execution context was destroyed/);
+    unsubscribe();
+    client.close();
+  } finally {
+    globalThis.WebSocket = originalWebSocket;
+  }
 });
 
 test('maps browser viewport coordinates through native browser chrome', () => {
@@ -92,6 +147,7 @@ test('uses the JPEG stream directly through both production bridge adapters', as
     /\(region, onFrame\) => startComponentSmuggleWindowStream\([\s\S]*?onFrame,\s*\)/g,
   ) || [];
   assert.equal(forwardingAdapters.length, 2);
+  assert.doesNotMatch(main, /item\.request\.source\.safariPage\s*\?\s*undefined\s*:/);
   assert.doesNotMatch(main, /H264|H264_ENABLED|window-region-h264/i);
 });
 
@@ -115,6 +171,22 @@ test('keeps existing smuggle bridges alive when another one starts', async () =>
   assert.match(main, /activeComponentSmuggles\.add\(bridge\)/);
   assert.match(main, /activeComponentSmuggles\.delete\(bridge\)/);
   assert.doesNotMatch(main, /await activeComponentSmuggle\?\.stop\(\)/);
+});
+
+test('evicts orphan input owners only from exclusive live slots', async () => {
+  const source = await readFile(new URL('../electron/component-smuggler.ts', import.meta.url), 'utf8');
+  assert.match(source, /mount\.hasAttribute\?\.\('data-attune-smuggle-slot'\)/);
+  assert.match(source, /:scope > attune-component-smuggle\[data-attune-component-smuggle-token\]/);
+  assert.match(source, /existingRuntime\?\.cleanup\?\.\(\)/);
+});
+
+test('keeps live request files as active leases until close or disconnect', async () => {
+  const main = await readFile(new URL('../electron/main.ts', import.meta.url), 'utf8');
+  assert.match(main, /const activeLiveComponentRequestIds = new Set<string>\(\)/);
+  assert.match(main, /readPendingComponentSmuggleRequests\(homePath, Date\.now\(\), activeLiveComponentRequestIds\)/);
+  assert.match(main, /activeLiveComponentRequestIds\.add\(requestId\)/);
+  assert.match(main, /activeLiveComponentRequestIds\.delete\(requestId\)/);
+  assert.match(main, /if \(!activeComponentSmuggles\.has\(bridge\)\) continue/);
 });
 
 test('keeps recurring app discovery off the component-smuggle event loop', async () => {
@@ -212,6 +284,22 @@ test('performs a one-shot source drain after a streamed click can open a satelli
   assert.match(source, /!this\.initialSourceDrainCompleted\s*\n\s*\|\| sourceClickMayHaveOpenedSatellite/);
 });
 
+test('uses only captured source pixels for popups in native visual mode', async () => {
+  const source = await readFile(new URL('../electron/component-smuggler.ts', import.meta.url), 'utf8');
+  assert.match(
+    source,
+    /visualViewport\.addEventListener\('pointermove',[\s\S]*?hideVisualHoverTooltip\(\);[\s\S]*?enqueueVisualHover/,
+  );
+  assert.match(
+    source,
+    /const renderSatellites = \(satellites: any\[\]\) => \{[\s\S]*?if \(currentVisualFrame\) return;/,
+  );
+  assert.match(
+    source,
+    /const applyVisual = \(frame: any\) => \{[\s\S]*?currentVisualFrame = frame;[\s\S]*?hideVisualHoverTooltip\(\);[\s\S]*?currentSatellites = \[\];/,
+  );
+});
+
 test('keeps a native smuggle alive while the destination renderer is temporarily paused', async () => {
   const anchor = componentSmuggleAnchor(selection, 'paused-destination-token');
   let drainAttempts = 0;
@@ -300,6 +388,93 @@ test('keeps a native smuggle alive while the destination renderer is temporarily
   assert.equal(streamStops, 1);
 });
 
+test('stops a conversation bridge when its destination context is invalidated', async () => {
+  const anchor = componentSmuggleAnchor(selection, 'invalidated-destination-token');
+  let invalidateTarget = () => {};
+  let stopped = null;
+  const sourceClient = {
+    async connect() {},
+    async evaluate(expression) {
+      if (expression.includes('?.status')) return { connected: true, visualIslandCount: 0 };
+      if (expression.includes('?.drain?.')) return [];
+      return { ok: true, connected: true, visualIslandCount: 0 };
+    },
+    async click() {}, async move() {}, async wheel() {}, async insertText() {}, async pressKey() {}, close() {},
+  };
+  const targetClient = {
+    async connect() {},
+    async evaluate(expression) {
+      if (expression.includes('?.status')) return { connected: true };
+      if (expression.includes('?.drainActions')) return [];
+      return { ok: true, connected: true };
+    },
+    async subscribeInvalidation(listener) {
+      invalidateTarget = listener;
+      return () => {};
+    },
+    async click() {}, async move() {}, async wheel() {}, async insertText() {}, async pressKey() {}, close() {},
+  };
+  const endpoint = { appId: 'fixture', appName: 'Fixture', webSocketDebuggerUrl: 'ws://fixture', anchor };
+  const bridge = new ComponentSmuggleBridge(
+    endpoint,
+    endpoint,
+    (reason, error) => { stopped = { reason, error }; },
+    undefined,
+    undefined,
+    { source: sourceClient, target: targetClient },
+  );
+
+  await bridge.start();
+  invalidateTarget(new Error('Fixture target execution context was destroyed'));
+  const deadline = Date.now() + 250;
+  while (!stopped && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.equal(stopped?.reason, 'error');
+  assert.match(stopped?.error?.message || '', /execution context was destroyed/);
+});
+
+test('treats a live conversation target timeout as reconnectable failure', async () => {
+  const anchor = componentSmuggleAnchor(selection, 'timed-out-conversation-token');
+  let targetDrains = 0;
+  let stopped = null;
+  const sourceClient = {
+    async connect() {},
+    async evaluate(expression) {
+      if (expression.includes('?.status')) return { connected: true, visualIslandCount: 0 };
+      if (expression.includes('?.drain?.')) return [];
+      return { ok: true, connected: true, visualIslandCount: 0 };
+    },
+    async click() {}, async move() {}, async wheel() {}, async insertText() {}, async pressKey() {}, close() {},
+  };
+  const targetClient = {
+    async connect() {},
+    async evaluate(expression) {
+      if (expression.includes('?.status')) return { connected: true };
+      if (expression.includes('?.drainActions')) {
+        targetDrains += 1;
+        throw new Error('Fixture target Runtime.evaluate timed out after 20000ms');
+      }
+      return { ok: true, connected: true };
+    },
+    async click() {}, async move() {}, async wheel() {}, async insertText() {}, async pressKey() {}, close() {},
+  };
+  const endpoint = { appId: 'fixture', appName: 'Fixture', webSocketDebuggerUrl: 'ws://fixture', anchor };
+  const bridge = new ComponentSmuggleBridge(
+    endpoint,
+    endpoint,
+    (reason, error) => { stopped = { reason, error }; },
+    undefined,
+    undefined,
+    { source: sourceClient, target: targetClient, targetTimeoutIsFatal: true },
+  );
+
+  await bridge.start();
+  assert.equal(targetDrains, 1);
+  assert.equal(stopped?.reason, 'error');
+  assert.match(stopped?.error?.message || '', /Runtime\.evaluate timed out/);
+});
+
 test('falls back to the DOM twin when the native source stream cannot start', async () => {
   const anchor = componentSmuggleAnchor(selection, 'stream-fallback-token');
   const sourceInstalls = [];
@@ -354,6 +529,42 @@ test('falls back to the DOM twin when the native source stream cannot start', as
   assert.match(sourceInstalls[1], /, false\)$/);
   assert.equal(sourceDrains, 1);
   assert.equal(targetApplies, 1);
+});
+
+test('does not silently replace a required native stream with the DOM twin', async () => {
+  const anchor = componentSmuggleAnchor(selection, 'required-stream-token');
+  let sourceInstalls = 0;
+  const sourceClient = {
+    async connect() {},
+    async evaluate(expression) {
+      if (expression.includes('function runComponentSmuggleSource')) sourceInstalls += 1;
+      if (expression.includes('captureRegion?.')) return {
+        x: 0, y: 0, width: 300, height: 80, rootWidth: 300, rootHeight: 80,
+        offsetX: 0, offsetY: 0, screenX: 0, screenY: 0, outerWidth: 300,
+        outerHeight: 80, innerWidth: 300, innerHeight: 80, contentOffsetX: 0, contentOffsetY: 0,
+      };
+      return { ok: true, connected: true, visualIslandCount: 0 };
+    },
+    async click() {}, async move() {}, async wheel() {}, async insertText() {}, async pressKey() {}, close() {},
+  };
+  const targetClient = {
+    async connect() {},
+    async evaluate() { return { ok: true, connected: true }; },
+    async click() {}, async move() {}, async wheel() {}, async insertText() {}, async pressKey() {}, close() {},
+  };
+  const endpoint = { appId: 'fixture', appName: 'Fixture', webSocketDebuggerUrl: 'ws://fixture', anchor };
+  const bridge = new ComponentSmuggleBridge(
+    endpoint,
+    endpoint,
+    undefined,
+    undefined,
+    async () => { throw new Error('required stream unavailable'); },
+    { source: sourceClient, target: targetClient, visualStreamRequired: true },
+  );
+
+  await assert.rejects(bridge.start(), /required stream unavailable/);
+  await bridge.stop();
+  assert.equal(sourceInstalls, 1);
 });
 
 test('forwards visual hover and bounds wheel gestures to the selected source component', async () => {

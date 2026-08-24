@@ -18,7 +18,11 @@ func encodeFrame(_ image: CGImage) -> Data {
   guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else {
     fail("could not create JPEG destination")
   }
-  let options = [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary
+  // Small translucent hover surfaces and their high-contrast labels expose
+  // JPEG ringing much sooner than the surrounding component. Keep the live
+  // stream near-lossless so source-composited tooltips retain their apparent
+  // opacity and edge sharpness in the destination.
+  let options = [kCGImageDestinationLossyCompressionQuality: 0.96] as CFDictionary
   CGImageDestinationAddImage(destination, image, options)
   guard CGImageDestinationFinalize(destination) else { fail("could not encode JPEG") }
   return data as Data
