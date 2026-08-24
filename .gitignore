@@ -6,3 +6,6 @@ build/icon.iconset/
 build/icon.png
 .DS_Store
 *.log
+.agent-docs/
+.clang-module-cache/
+.npm-cache/
