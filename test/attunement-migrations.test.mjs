@@ -45,6 +45,7 @@ test('built-in attunement implementations consume shared semantic roles', async 
     join(assetsRoot, 'codex-youtube-player', 'apps', 'chrome-youtube-source.js'),
     join(assetsRoot, 'chatgpt-claude-models', 'apps', 'chatgpt-claude-models.js'),
     join(assetsRoot, 'codex-kanban', 'apps', 'codex-kanban.js'),
+    join(assetsRoot, 'codex-kanban-manual', 'apps', 'codex-kanban-manual.js'),
     join(assetsRoot, 'linear-completed-to-slack', 'apps', 'linear-completion-source.js'),
     join(assetsRoot, 'linear-completed-to-slack', 'apps', 'slack-completion-dm.js'),
   ];

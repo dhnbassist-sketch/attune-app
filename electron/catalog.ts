@@ -39,11 +39,23 @@ export function readCatalog(catalogRoot: string): AttuneCatalog {
   return catalog;
 }
 
-export function installCatalogAttunements(catalogRoot: string, destinationRoot: string): void {
+export function installCatalogAttunements(
+  catalogRoot: string,
+  destinationRoot: string,
+  attunementIds?: readonly string[],
+): void {
   const catalog = readCatalog(catalogRoot);
   mkdirSync(destinationRoot, { recursive: true });
 
-  for (const entry of catalog.attunements) {
+  const entries = attunementIds
+    ? attunementIds.map((id) => {
+      const entry = catalog.attunements.find((candidate) => candidate.id === id);
+      if (!entry) throw new Error(`Attunement not found in catalog: ${id}`);
+      return entry;
+    })
+    : catalog.attunements;
+
+  for (const entry of entries) {
     installManagedPackage(catalogRoot, destinationRoot, entry, 'attunement');
   }
 }

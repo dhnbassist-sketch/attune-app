@@ -2112,7 +2112,7 @@ function ensureUserWorkspacesRoot(workspacesRoot: string, catalogRoot: string): 
     writeFileSync(readmePath, USER_WORKSPACES_README);
   }
 
-  installCatalogAttunements(catalogRoot, workspacesRoot);
+  installCatalogAttunements(catalogRoot, workspacesRoot, ['codex-kanban', 'codex-kanban-manual']);
   return workspacesRoot;
 }
 
