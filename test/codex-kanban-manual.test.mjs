@@ -31,6 +31,8 @@ test('Manual Chat Kanban keeps auto Codex status while applying local placements
   assert.match(source, /JSON\.parse\(localStorage\.getItem\(MANUAL_PLACEMENT_KEY\)/);
   assert.match(source, /localStorage\.setItem\(MANUAL_PLACEMENT_KEY/);
   assert.match(source, /readManualPlacements\(\)/);
+  assert.match(source, /mode: 'manual'/);
+  assert.match(source, /locked: placement\.locked === true/);
   assert.match(source, /manualPlacements\.get\(thread\.id\)\?\.column \|\| autoStageFor\(thread\)/);
   assert.match(source, /autoStageLabelFor\(thread\)/);
   assert.match(source, /status\.textContent = `Codex: \$\{autoStageLabelFor\(thread\)\}`/);
@@ -50,6 +52,16 @@ test('Manual Chat Kanban supports drag drop movement and reorder without opening
   assert.match(source, /addEventListener\('drop'/);
   assert.match(source, /dropIndexFor\(body, event\.clientY\)/);
   assert.match(source, /saveManualDrop\(threadId, stageId/);
+  assert.match(source, /const restoreAutomaticPlacement = \(threadId\)/);
+  assert.match(source, /const releaseTemporaryManualPlacement = \(threadId\)/);
+  assert.match(source, /const toggleManualLock = \(threadId\)/);
+  assert.match(source, /locked: previous\?\.locked === true/);
+  assert.match(source, /locked: placement\.locked !== true/);
+  assert.match(source, /case 'turn\/started':[\s\S]*releaseTemporaryManualPlacement\(threadId\)/);
+  assert.match(source, /dataset\.manualLock/);
+  assert.match(source, /dataset\.autoRestore/);
+  assert.match(source, /restoreAutomaticPlacement\(thread\.id\)/);
+  assert.doesNotMatch(source, /for \(const \[order, thread\] of existing\.entries\(\)\)/);
   assert.match(source, /clickSuppressedUntil/);
   assert.match(source, /event\.preventDefault\(\);\s+event\.stopPropagation\(\);\s+return;/);
   assert.doesNotMatch(source, /thread\/status\/update|thread\/update|thread\/set-status/);
@@ -66,6 +78,7 @@ test('Manual Chat Kanban uses isolated DOM ids, classes, and storage keys', asyn
   assert.match(source, /toLowerCase\(\) !== 'm'/);
   assert.match(styles, /#attune-codex-kanban-manual/);
   assert.match(styles, /\.attune-kanban-manual-status-badge/);
+  assert.match(styles, /\.attune-kanban-manual-lock/);
   assert.match(styles, /\[data-drop-target="true"\]/);
   assert.doesNotMatch(source, /__attuneCodexKanbanCleanup\?\./);
   assert.doesNotMatch(source, /id = 'attune-codex-kanban'/);

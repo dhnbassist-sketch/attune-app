@@ -31,18 +31,22 @@ test('catalog installer installs managed packages and preserves unmarked custom 
   }
 });
 
-test('catalog installer can install Codex Kanban attunements without removing existing workspaces', async () => {
+test('catalog installer can install Codex Kanban and Chat Canvas attunements without removing existing workspaces', async () => {
   const destination = await mkdtemp(join(tmpdir(), 'attune-catalog-'));
   try {
     const existingWorkspace = join(destination, 'existing-user-attunement');
     await mkdir(existingWorkspace);
     await writeFile(join(existingWorkspace, 'manifest.json'), '{"name":"Existing user attunement"}\n');
 
-    installCatalogAttunements(catalogRoot, destination, ['codex-kanban', 'codex-kanban-manual']);
+    installCatalogAttunements(catalogRoot, destination, [
+      'codex-kanban',
+      'codex-kanban-manual',
+      'codex-multi-chat',
+    ]);
 
     assert.deepEqual(
       (await readdir(destination)).sort(),
-      ['codex-kanban', 'codex-kanban-manual', 'existing-user-attunement'],
+      ['codex-kanban', 'codex-kanban-manual', 'codex-multi-chat', 'existing-user-attunement'],
     );
     const marker = JSON.parse(await readFile(
       join(destination, 'codex-kanban', '.attune-package.json'),
@@ -55,7 +59,13 @@ test('catalog installer can install Codex Kanban attunements without removing ex
       'utf8',
     ));
     assert.equal(manualMarker.id, 'codex-kanban-manual');
-    assert.equal(manualMarker.version, '1.0.0');
+    assert.equal(manualMarker.version, '1.0.1');
+    const canvasMarker = JSON.parse(await readFile(
+      join(destination, 'codex-multi-chat', '.attune-package.json'),
+      'utf8',
+    ));
+    assert.equal(canvasMarker.id, 'codex-multi-chat');
+    assert.equal(canvasMarker.version, '1.0.1');
     assert.equal(
       await readFile(join(existingWorkspace, 'manifest.json'), 'utf8'),
       '{"name":"Existing user attunement"}\n',
